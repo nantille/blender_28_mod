@@ -778,6 +778,10 @@ ccl_device_inline float3 curve_refine(KernelGlobals *kg,
 
     if (kernel_data.curve.curveflags & CURVE_KN_RIBBONS) {
       sd->Ng = normalize(-(D - tg * (dot(tg, D))));
+#ifdef __UV__
+      float3 p_curr = curvepoint(isect->u, p[0], p[1], p[2], p[3]);
+      sd->v = dot(normalize(p_curr), tg);
+#endif
     }
     else {
 #  ifdef __EMBREE__

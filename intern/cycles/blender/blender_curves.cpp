@@ -106,6 +106,333 @@ static void InterpolateKeySegments(
     curveinterp_v3_v3v3v3v3(keyloc, &ckey_loc1, &ckey_loc2, &ckey_loc3, &ckey_loc4, t);
 }
 
+// Very similar to BKE_curve_forward_diff_bezier() from source/blender/blenkernel/intern/curve.c
+static void forward_diff_bezier(const float3& q0,
+                                const float3& q1,
+                                const float3& q2,
+                                const float3& q3,
+                                int resolution,
+                                vector<float3> *points)
+{
+	const float resolution2 = resolution*resolution;
+	const float resolution3 = resolution2*resolution;
+	const float3 rt0 = q0;
+	const float3 rt1 = 3.0f * (q1 - q0) / resolution;
+	const float3 rt2 = 3.0f * (q0 - 2.0f * q1 + q2) / resolution2;
+	const float3 rt3 = (q3 - q0 + 3.0f * (q1 - q2)) / resolution3;
+	float3 a0 = rt0;
+	float3 a1 = rt1 + rt2 + rt3;
+	float3 a2 = 2 * rt2 + 6 * rt3;
+	float3 a3 = 6 * rt3;
+  //if (points->capacity() < resolution + 1)
+	//points->resize(resolution + 1);
+	for (int i = 0; i <= resolution; ++i) 
+  {
+		(*points)[i] = a0;
+		a0 += a1;
+		a1 += a2;
+		a2 += a3;
+	}
+}
+
+/* 
+This is the transition part. We get data from Blender and prepare it for Cycles.
+Here, we handle splines and curve data. Be warned about variable names: 
+in C/C++ sources of Cycles, "curve" describes both curve objects and splines (!).
+Also, custom data was added to SplinePoint and BezierSplinePoint, namely "key" and "value",
+two 4 byte float that can store custom data that will be reflected and available in
+HairInfo node as HairInfo.Key and HairInfo.Value.
+Some of the features that are supported here:
+- per spline materials using material_index attribute
+- proper nurbs and bezier interpolations
+- resolution == 1 makes a copy of raw data without interp, which is faster
+*/
+static bool ObtainCurveData(Mesh *mesh,
+                            BL::Mesh *b_mesh,
+                            BL::Object *b_ob,
+                            ParticleCurveData *CData,
+                            bool background)
+{
+  if(!(mesh && b_mesh && b_ob && CData))
+      return false;
+    
+  BL::ID b_ob_data = b_ob->data();
+  if(!b_ob_data || !b_ob_data.is_a(&RNA_Curve))
+    return false;
+
+	BL::Curve b_curve(b_ob->data());
+	const int num_splines = b_curve.splines.length();
+	if(num_splines == 0)
+		return false;
+
+	bool render_as_hair = false;
+  float reveal_amount = 1.0f;
+	if(!b_ob_data || b_ob_data.is_a(&RNA_Curve)) 
+  {
+    // "cycles_curves" is here a property of the Curve data 
+		PointerRNA cycles_curves = RNA_pointer_get(&b_ob_data.ptr, "cycles_curves");
+		render_as_hair = get_boolean(cycles_curves, "render_as_hair");
+    reveal_amount = b_curve.bevel_factor_end();
+	}
+
+  if (reveal_amount == 0.0f)
+    return false;
+
+	if(!render_as_hair)
+    return false;
+
+	CData->psys_firstcurve.push_back_slow(0);
+	CData->psys_curvenum.push_back_slow(num_splines);
+  CData->render_as_hair.push_back_slow(render_as_hair);
+
+  CData->curve_keynum.reserve(num_splines);
+  CData->curve_shader.reserve(num_splines);
+  CData->curve_length.reserve(num_splines);
+  CData->curve_firstkey.reserve(num_splines);
+  
+  //vector<float> curves_entire_length;
+  //curves_entire_length.reserve(num_splines);
+  float all_curves_length = 0.0;
+  float max_curve_length = 0.0;
+  
+  // Computing lengths beforehand so that we can stop adding points if the user chose 
+  // to reveal only parts of the splines.
+  for(int spline = 0; spline < num_splines; ++spline) 
+  {
+    BL::Spline b_spline = b_curve.splines[spline];
+    const bool is_bezier = (b_spline.type() == BL::Spline::type_BEZIER);
+    const int num_points = is_bezier ? b_spline.bezier_points.length() : b_spline.points.length();
+
+		float curve_length = 0.0f;
+		float3 prev_co;
+    for(int point = 0; point <= num_points-1; ++point) 
+    {
+      if(is_bezier)
+      {
+        BL::BezierSplinePoint b_curr_point = b_spline.bezier_points[point];
+
+        const float3 co = get_float3(b_curr_point.co());
+        if(point != 0) 
+        {
+          const float step_length = len(co - prev_co);
+          if(step_length == 0.0f)
+            continue;
+          curve_length += step_length;
+        }
+        prev_co = co;
+      }
+      else
+      {
+        BL::SplinePoint b_curr_point = b_spline.points[point];
+
+        // Forced to duplicate code here, there's no abstract class for BezierSplinePoint and SplinePoint
+        const float3 co = get_float3(b_curr_point.co());
+        if(point != 0) 
+        {
+          const float step_length = len(co - prev_co);
+          if(step_length == 0.0f)
+            continue;
+          curve_length += step_length;
+        }
+        prev_co = co;
+      }
+    }
+    if (max_curve_length < curve_length)
+        max_curve_length = curve_length;
+    all_curves_length += curve_length;
+    //curves_entire_length.push_back(curve_length);
+  }
+  //double max_length = *max_element(curves_entire_length.begin(), curves_entire_length.end());
+
+  const float reveal_threshold = all_curves_length * reveal_amount;
+  float current_curves_length = 0.0f;
+	int keyno = 0;
+  // Variables refer to splines here as this is really what you have in the UI.
+  // In Cycles code, splines are curves and curves are "psys" or particle systems.
+	for(int spline = 0; spline < num_splines; ++spline) 
+  {
+		BL::Spline b_spline = b_curve.splines[spline];
+    const bool is_bezier = (b_spline.type() == BL::Spline::type_BEZIER);
+		const int num_points = is_bezier ? b_spline.bezier_points.length() : b_spline.points.length();
+		int resolution = background ? b_curve.render_resolution_u() : b_spline.resolution_u();
+		if(resolution == 0)
+			resolution = b_curve.resolution_u();
+    if(resolution == 0)
+      resolution = 1;
+
+		CData->curve_firstkey.push_back_slow(keyno);
+    const int shader = clamp(b_spline.material_index(), 0, mesh->used_shaders.size()-1);
+    CData->curve_shader.push_back_slow(shader);
+
+    // If resolution == 1, these reserve() are still valid.
+    // Older code used resize() + push_back_slow(), now it's reserve() + push_back_slow()
+    // which should be slightly faster.
+    const int reserve_size = num_points * resolution;
+    CData->curvekey_co.reserve(CData->curvekey_co.capacity() + reserve_size);
+    CData->curvekey_radius.reserve(CData->curvekey_radius.capacity() + reserve_size);
+    CData->curvekey_time.reserve(CData->curvekey_time.capacity() + reserve_size);
+    CData->curvekey_key.reserve(CData->curvekey_key.capacity() + reserve_size);
+    CData->curvekey_value.reserve(CData->curvekey_value.capacity() + reserve_size);
+
+		int keynum = 0;
+		float curve_length = 0.0f;
+		float3 prev_co;
+
+    // When resolution equals 1, no interpolation is performed, we directly copy the given data
+    if (resolution == 1)
+    {
+      for(int point = 0; point <= num_points-1; ++point) 
+      {
+        if(is_bezier) 
+        {
+          BL::BezierSplinePoint b_curr_point = b_spline.bezier_points[point];
+
+          const float3 co = get_float3(b_curr_point.co());
+          if(point != 0) 
+          {
+            const float step_length = len(co - prev_co);
+            if(step_length == 0.0f)
+              continue;
+            curve_length += step_length;
+            current_curves_length += step_length;
+            if(reveal_amount < 1.0f && current_curves_length > reveal_threshold)
+              break;
+          }
+          CData->curvekey_co.push_back_slow(co);
+          CData->curvekey_radius.push_back_slow(b_curr_point.radius());
+          CData->curvekey_time.push_back_slow(curve_length);
+          CData->curvekey_key.push_back_slow(b_curr_point.key());
+          CData->curvekey_value.push_back_slow(b_curr_point.value());
+          prev_co = co;
+          }
+          else
+          {
+            BL::SplinePoint b_curr_point = b_spline.points[point];
+
+            // Forced to duplicate code here, there's no abstract class for BezierSplinePoint and SplinePoint
+            const float3 co = get_float3(b_curr_point.co());
+            if(point != 0) 
+            {
+              const float step_length = len(co - prev_co);
+              if(step_length == 0.0f)
+                continue;
+              curve_length += step_length;
+              current_curves_length += step_length;
+              if(reveal_amount < 1.0f && current_curves_length > reveal_threshold)
+                break;
+            }
+            CData->curvekey_co.push_back_slow(co);
+            CData->curvekey_radius.push_back_slow(b_curr_point.radius());
+            CData->curvekey_time.push_back_slow(curve_length);
+            CData->curvekey_key.push_back_slow(b_curr_point.key());
+            CData->curvekey_value.push_back_slow(b_curr_point.value());
+            prev_co = co;
+          }
+        }
+        CData->curve_keynum.push_back_slow(num_points);
+        CData->curve_length.push_back_slow(curve_length);
+        continue;
+      }
+        
+    // Interpolation of given spline points when resolution larger than 1
+    for(int point = 0; point < num_points - 1; ++point) 
+    {
+      vector<float3> points(resolution + 1);
+      vector<float> radii(resolution + 1);
+      vector<float> custom_data_keys(resolution + 1);
+      vector<float> custom_data_values(resolution + 1);
+      if(is_bezier) 
+      {
+        BL::BezierSplinePoint b_curr_point = b_spline.bezier_points[point];
+        BL::BezierSplinePoint b_next_point = b_spline.bezier_points[point + 1];
+        const float3 q0 = get_float3(b_curr_point.co());
+        const float3 q1 = get_float3(b_curr_point.handle_right());
+        const float3 q2 = get_float3(b_next_point.handle_left());
+        const float3 q3 = get_float3(b_next_point.co());
+        forward_diff_bezier(q0, q1, q2, q3, resolution, &points);
+
+        // Data could be evaluated with a bezier spline. Currently using linear interpolation.
+        for (int i = 0; i <= resolution; ++i)
+        {
+          radii[i] = b_curr_point.radius() + (b_next_point.radius() - b_curr_point.radius()) / resolution * i;
+          custom_data_keys[i] = b_curr_point.key() + (b_next_point.key() - b_curr_point.key()) / resolution * i;
+          custom_data_values[i] = b_curr_point.value() + (b_next_point.value() - b_curr_point.value()) / resolution * i;
+        }
+      }
+      else 
+      {
+        BL::SplinePoint b_curr_point = b_spline.points[point];
+        BL::SplinePoint b_next_point = b_spline.points[point + 1];
+
+        for (int i = 0; i <= resolution; ++i) 
+        {
+          float3 ckey_loc1 = get_float3(b_curr_point.co());
+          float3 ckey_loc2 = ckey_loc1;
+          float3 ckey_loc3 = get_float3(b_next_point.co());
+          float3 ckey_loc4 = ckey_loc3;
+
+          if(point > 0) 
+          {
+            BL::SplinePoint b_prev_point = b_spline.points[point-1];
+            ckey_loc1 = get_float3(b_prev_point.co());
+          }
+
+          if(point < num_points - 2)
+          {
+            BL::SplinePoint b_second_next_point = b_spline.points[point+2];
+            ckey_loc4 = get_float3(b_second_next_point.co());
+          }
+
+          float weights[4];
+          interp_weights((float)i / (float)resolution, weights);
+
+          float3 interp_point;
+          curveinterp_v3_v3v3v3v3(&interp_point, &ckey_loc1, &ckey_loc2, &ckey_loc3, &ckey_loc4, weights);
+          points[i] = interp_point;
+
+          // Data could be evaluated with a nurbs. Currently using linear interpolation.
+          radii[i] = b_curr_point.radius() + (b_next_point.radius() - b_curr_point.radius()) / resolution * i;
+          custom_data_keys[i] = b_curr_point.key() + (b_next_point.key() - b_curr_point.key()) / resolution * i;
+          custom_data_values[i] = b_curr_point.value() + (b_next_point.value() - b_curr_point.value()) / resolution * i;
+        }
+      }
+
+      // Store the interpolated values
+      for (int interp_i = 0; interp_i <= resolution; ++interp_i) 
+      {
+        const float3 co = points[interp_i];
+        const float radius = radii[interp_i];
+        const float custom_data_key = custom_data_keys[interp_i];
+        const float custom_data_value = custom_data_values[interp_i];
+
+        if(!(point == 0 && interp_i == 0)) 
+        {
+          const float step_length = len(co - prev_co);
+          if(step_length == 0.0f)
+            continue;
+          curve_length += step_length;
+          current_curves_length += step_length;
+          if(reveal_amount < 1.0f && current_curves_length > reveal_threshold)
+              break;
+        }
+        CData->curvekey_co.push_back_slow(co);
+        CData->curvekey_radius.push_back_slow(radius);
+        CData->curvekey_time.push_back_slow(curve_length);
+        CData->curvekey_key.push_back_slow(custom_data_key);
+        CData->curvekey_value.push_back_slow(custom_data_value);
+
+        prev_co = co;
+        ++keynum;
+			}
+		}
+		keyno += keynum;
+
+		CData->curve_keynum.push_back_slow(keynum);
+		CData->curve_length.push_back_slow(curve_length);
+	}
+	return true;
+}
+    
 static bool ObtainCacheParticleData(
     Mesh *mesh, BL::Mesh *b_mesh, BL::Object *b_ob, ParticleCurveData *CData, bool background)
 {
@@ -128,9 +455,9 @@ static bool ObtainCacheParticleData(
 
       if ((b_part.render_type() == BL::ParticleSettings::render_type_PATH) &&
           (b_part.type() == BL::ParticleSettings::type_HAIR)) {
-        int shader = clamp(b_part.material() - 1, 0, mesh->used_shaders.size() - 1);
-        int display_step = background ? b_part.render_step() : b_part.display_step();
-        int totparts = b_psys.particles.length();
+        const int shader = clamp(b_part.material() - 1, 0, mesh->used_shaders.size() - 1);
+        const int display_step = background ? b_part.render_step() : b_part.display_step();
+        const int totparts = b_psys.particles.length();
         int totchild = background ? b_psys.child_particles.length() :
                                     (int)((float)b_psys.child_particles.length() *
                                           (float)b_part.display_percentage() / 100.0f);
@@ -185,6 +512,10 @@ static bool ObtainCacheParticleData(
             }
             CData->curvekey_co.push_back_slow(cKey);
             CData->curvekey_time.push_back_slow(curve_length);
+            // [Nicolas Antille] Hair from a p-system could be given key-value data through python API
+            // But I'm not sure how... TODO later
+            CData->curvekey_key.push_back_slow(0.0);
+            CData->curvekey_value.push_back_slow(0.0);
             pcKey = cKey;
             keynum++;
           }
@@ -349,7 +680,10 @@ static void ExportCurveTrianglePlanes(Mesh *mesh,
   mesh->reserve_mesh(mesh->verts.size() + numverts, mesh->num_triangles() + numtris);
 
   /* actually export */
+  bool render_as_hair = false;
   for (int sys = 0; sys < CData->psys_firstcurve.size(); sys++) {
+    if (CData->render_as_hair.size() > sys)
+      render_as_hair = CData->render_as_hair[sys];
     for (int curve = CData->psys_firstcurve[sys];
          curve < CData->psys_firstcurve[sys] + CData->psys_curvenum[sys];
          curve++) {
@@ -357,8 +691,13 @@ static void ExportCurveTrianglePlanes(Mesh *mesh,
       float3 v1;
       float time = 0.0f;
       float3 ickey_loc = CData->curvekey_co[CData->curve_firstkey[curve]];
-      float radius = shaperadius(
-          CData->psys_shape[sys], CData->psys_rootradius[sys], CData->psys_tipradius[sys], 0.0f);
+      float radius;
+      if (render_as_hair) {
+        radius = CData->curvekey_radius[CData->curve_firstkey[curve]];
+      }
+      else {
+        radius = shaperadius(CData->psys_shape[sys], CData->psys_rootradius[sys], CData->psys_tipradius[sys], 0.0f);
+      }
       v1 = CData->curvekey_co[CData->curve_firstkey[curve] + 1] -
            CData->curvekey_co[CData->curve_firstkey[curve]];
       if (is_ortho)
@@ -370,6 +709,13 @@ static void ExportCurveTrianglePlanes(Mesh *mesh,
       mesh->add_vertex(ickey_loc_shfl);
       mesh->add_vertex(ickey_loc_shfr);
       vertexindex += 2;
+        
+      int shader;
+      if (render_as_hair)
+        // "curve" variable is referring to a spline here
+        shader = CData->curve_shader[curve];
+      else
+        shader = CData->psys_shader[sys];
 
       for (int curvekey = CData->curve_firstkey[curve] + 1;
            curvekey < CData->curve_firstkey[curve] + CData->curve_keynum[curve];
@@ -383,18 +729,23 @@ static void ExportCurveTrianglePlanes(Mesh *mesh,
           v1 = CData->curvekey_co[curvekey + 1] - CData->curvekey_co[curvekey - 1];
 
         time = CData->curvekey_time[curvekey] / CData->curve_length[curve];
-        radius = shaperadius(
-            CData->psys_shape[sys], CData->psys_rootradius[sys], CData->psys_tipradius[sys], time);
+        if (render_as_hair) {
+          radius = CData->curvekey_radius[curvekey];
+        }
+        else{
+          radius = shaperadius(
+              CData->psys_shape[sys], CData->psys_rootradius[sys], CData->psys_tipradius[sys], time);
 
-        if (curvekey == CData->curve_firstkey[curve] + CData->curve_keynum[curve] - 1)
-          radius = shaperadius(CData->psys_shape[sys],
-                               CData->psys_rootradius[sys],
-                               CData->psys_tipradius[sys],
-                               0.95f);
+          if (curvekey == CData->curve_firstkey[curve] + CData->curve_keynum[curve] - 1)
+            radius = shaperadius(CData->psys_shape[sys],
+                                 CData->psys_rootradius[sys],
+                                 CData->psys_tipradius[sys],
+                                 0.95f);
 
-        if (CData->psys_closetip[sys] &&
-            (curvekey == CData->curve_firstkey[curve] + CData->curve_keynum[curve] - 1))
-          radius = shaperadius(CData->psys_shape[sys], CData->psys_rootradius[sys], 0.0f, 0.95f);
+          if (CData->psys_closetip[sys] &&
+              (curvekey == CData->curve_firstkey[curve] + CData->curve_keynum[curve] - 1))
+            radius = shaperadius(CData->psys_shape[sys], CData->psys_rootradius[sys], 0.0f, 0.95f);
+        }
 
         if (is_ortho)
           xbasis = normalize(cross(RotCam, v1));
@@ -405,9 +756,9 @@ static void ExportCurveTrianglePlanes(Mesh *mesh,
         mesh->add_vertex(ickey_loc_shfl);
         mesh->add_vertex(ickey_loc_shfr);
         mesh->add_triangle(
-            vertexindex - 2, vertexindex, vertexindex - 1, CData->psys_shader[sys], true);
+            vertexindex - 2, vertexindex, vertexindex - 1, shader, true);
         mesh->add_triangle(
-            vertexindex + 1, vertexindex - 1, vertexindex, CData->psys_shader[sys], true);
+            vertexindex + 1, vertexindex - 1, vertexindex, shader, true);
         vertexindex += 2;
       }
     }
@@ -442,7 +793,10 @@ static void ExportCurveTriangleGeometry(Mesh *mesh, ParticleCurveData *CData, in
   mesh->reserve_mesh(mesh->verts.size() + numverts, mesh->num_triangles() + numtris);
 
   /* actually export */
+  bool render_as_hair = false;
   for (int sys = 0; sys < CData->psys_firstcurve.size(); sys++) {
+    if (CData->render_as_hair.size() > sys)
+      render_as_hair = CData->render_as_hair[sys];
     for (int curve = CData->psys_firstcurve[sys];
          curve < CData->psys_firstcurve[sys] + CData->psys_curvenum[sys];
          curve++) {
@@ -486,6 +840,13 @@ static void ExportCurveTriangleGeometry(Mesh *mesh, ParticleCurveData *CData, in
           break;
         }
       }
+        
+      int shader;
+      if (render_as_hair)
+        // "curve" variable is actually referring to a spline here
+        shader = CData->curve_shader[curve];
+      else
+        shader = CData->psys_shader[sys];
 
       for (int curvekey = CData->curve_firstkey[curve];
            curvekey < CData->curve_firstkey[curve] + CData->curve_keynum[curve] - 1;
@@ -527,24 +888,29 @@ static void ExportCurveTriangleGeometry(Mesh *mesh, ParticleCurveData *CData, in
         for (; subv <= 1; subv++) {
           float3 ickey_loc = make_float3(0.0f, 0.0f, 0.0f);
           float time = 0.0f;
-
+          float radius;
           InterpolateKeySegments(subv, 1, curvekey, curve, &ickey_loc, &time, CData);
 
-          float radius = shaperadius(CData->psys_shape[sys],
-                                     CData->psys_rootradius[sys],
-                                     CData->psys_tipradius[sys],
-                                     time);
-
-          if ((curvekey == CData->curve_firstkey[curve] + CData->curve_keynum[curve] - 2) &&
-              (subv == 1))
+          if (render_as_hair) {
+            radius = CData->curvekey_radius[curvekey];
+          }
+          else {
             radius = shaperadius(CData->psys_shape[sys],
-                                 CData->psys_rootradius[sys],
-                                 CData->psys_tipradius[sys],
-                                 0.95f);
+                                       CData->psys_rootradius[sys],
+                                       CData->psys_tipradius[sys],
+                                       time);
 
-          if (CData->psys_closetip[sys] && (subv == 1) &&
-              (curvekey == CData->curve_firstkey[curve] + CData->curve_keynum[curve] - 2))
-            radius = shaperadius(CData->psys_shape[sys], CData->psys_rootradius[sys], 0.0f, 0.95f);
+            if ((curvekey == CData->curve_firstkey[curve] + CData->curve_keynum[curve] - 2) &&
+                (subv == 1))
+              radius = shaperadius(CData->psys_shape[sys],
+                                   CData->psys_rootradius[sys],
+                                   CData->psys_tipradius[sys],
+                                   0.95f);
+
+            if (CData->psys_closetip[sys] && (subv == 1) &&
+                (curvekey == CData->curve_firstkey[curve] + CData->curve_keynum[curve] - 2))
+              radius = shaperadius(CData->psys_shape[sys], CData->psys_rootradius[sys], 0.0f, 0.95f);
+          }
 
           float angle = M_2PI_F / (float)resolution;
           for (int section = 0; section < resolution; section++) {
@@ -558,23 +924,23 @@ static void ExportCurveTriangleGeometry(Mesh *mesh, ParticleCurveData *CData, in
               mesh->add_triangle(vertexindex - resolution + section,
                                  vertexindex + section,
                                  vertexindex - resolution + section + 1,
-                                 CData->psys_shader[sys],
+                                 shader,
                                  true);
               mesh->add_triangle(vertexindex + section + 1,
                                  vertexindex - resolution + section + 1,
                                  vertexindex + section,
-                                 CData->psys_shader[sys],
+                                 shader,
                                  true);
             }
             mesh->add_triangle(vertexindex - 1,
                                vertexindex + resolution - 1,
                                vertexindex - resolution,
-                               CData->psys_shader[sys],
+                               shader,
                                true);
             mesh->add_triangle(vertexindex,
                                vertexindex - resolution,
                                vertexindex + resolution - 1,
-                               CData->psys_shader[sys],
+                               shader,
                                true);
           }
           vertexindex += resolution;
@@ -597,25 +963,44 @@ static void ExportCurveSegments(Scene *scene, Mesh *mesh, ParticleCurveData *CDa
 {
   int num_keys = 0;
   int num_curves = 0;
+  int human_countable_num_curves = 0;
 
-  if (mesh->num_curves())
-    return;
+  if(mesh->num_curves())
+      return;
 
   Attribute *attr_intercept = NULL;
   Attribute *attr_random = NULL;
+  Attribute *attr_index = NULL;
+  Attribute *attr_count = NULL;
+  Attribute *attr_length = NULL;
+  Attribute *attr_key = NULL;
+  Attribute *attr_value = NULL;
 
   if (mesh->need_attribute(scene, ATTR_STD_CURVE_INTERCEPT))
     attr_intercept = mesh->curve_attributes.add(ATTR_STD_CURVE_INTERCEPT);
   if (mesh->need_attribute(scene, ATTR_STD_CURVE_RANDOM))
     attr_random = mesh->curve_attributes.add(ATTR_STD_CURVE_RANDOM);
+  if(mesh->need_attribute(scene, ATTR_STD_CURVE_INDEX))
+      attr_index = mesh->curve_attributes.add(ATTR_STD_CURVE_INDEX);
+  if(mesh->need_attribute(scene, ATTR_STD_CURVE_COUNT))
+      attr_count = mesh->curve_attributes.add(ATTR_STD_CURVE_COUNT);
+  if(mesh->need_attribute(scene, ATTR_STD_CURVE_LENGTH))
+      attr_length = mesh->curve_attributes.add(ATTR_STD_CURVE_LENGTH);
+  if(mesh->need_attribute(scene, ATTR_STD_CURVE_KEY))
+      attr_key = mesh->curve_attributes.add(ATTR_STD_CURVE_KEY);
+  if(mesh->need_attribute(scene, ATTR_STD_CURVE_VALUE))
+      attr_value = mesh->curve_attributes.add(ATTR_STD_CURVE_VALUE);
 
   /* compute and reserve size of arrays */
-  for (int sys = 0; sys < CData->psys_firstcurve.size(); sys++) {
+  for (int sys = 0; sys < CData->psys_firstcurve.size(); sys++) 
+  {
     for (int curve = CData->psys_firstcurve[sys];
          curve < CData->psys_firstcurve[sys] + CData->psys_curvenum[sys];
-         curve++) {
+         curve++) 
+    {
       num_keys += CData->curve_keynum[curve];
       num_curves++;
+      human_countable_num_curves++;
     }
   }
 
@@ -629,28 +1014,47 @@ static void ExportCurveSegments(Scene *scene, Mesh *mesh, ParticleCurveData *CDa
   num_curves = 0;
 
   /* actually export */
-  for (int sys = 0; sys < CData->psys_firstcurve.size(); sys++) {
+  bool render_as_hair = false;
+  for (int sys = 0; sys < CData->psys_firstcurve.size(); sys++) 
+  {
+    if (CData->render_as_hair.size() > sys)
+      render_as_hair = CData->render_as_hair[sys];
     for (int curve = CData->psys_firstcurve[sys];
          curve < CData->psys_firstcurve[sys] + CData->psys_curvenum[sys];
-         curve++) {
+         curve++) 
+    {
       size_t num_curve_keys = 0;
 
       for (int curvekey = CData->curve_firstkey[curve];
            curvekey < CData->curve_firstkey[curve] + CData->curve_keynum[curve];
-           curvekey++) {
+           curvekey++) 
+      {
         const float3 ickey_loc = CData->curvekey_co[curvekey];
         const float curve_time = CData->curvekey_time[curvekey];
         const float curve_length = CData->curve_length[curve];
         const float time = (curve_length > 0.0f) ? curve_time / curve_length : 0.0f;
-        float radius = shaperadius(
-            CData->psys_shape[sys], CData->psys_rootradius[sys], CData->psys_tipradius[sys], time);
-        if (CData->psys_closetip[sys] &&
-            (curvekey == CData->curve_firstkey[curve] + CData->curve_keynum[curve] - 1)) {
-          radius = 0.0f;
+        float radius = 0.0f;
+        if (render_as_hair) 
+        {
+          radius = CData->curvekey_radius[curvekey];
+        }
+        else 
+        {
+          radius = shaperadius(
+          CData->psys_shape[sys], CData->psys_rootradius[sys], CData->psys_tipradius[sys], time);
+          if (CData->psys_closetip[sys] &&
+              (curvekey == CData->curve_firstkey[curve] + CData->curve_keynum[curve] - 1))
+            radius = 0.0f;
         }
         mesh->add_curve_key(ickey_loc, radius);
         if (attr_intercept)
           attr_intercept->add(time);
+
+        if(attr_value != NULL)
+          attr_value->add(CData->curvekey_value[curvekey]);
+
+        if(attr_key != NULL)
+          attr_key->add(CData->curvekey_key[curvekey]);
 
         num_curve_keys++;
       }
@@ -659,7 +1063,23 @@ static void ExportCurveSegments(Scene *scene, Mesh *mesh, ParticleCurveData *CDa
         attr_random->add(hash_uint2_to_float(num_curves, 0));
       }
 
-      mesh->add_curve(num_keys, CData->psys_shader[sys]);
+      if (attr_index != NULL)
+        attr_index->add(static_cast< float >(curve));
+
+      if (attr_count != NULL)
+        attr_count->add(static_cast< float >(human_countable_num_curves));
+
+      if (attr_length != NULL)
+        attr_length->add(CData->curve_length[curve]);
+
+      int shader;
+      // Variable "curve" is actually referring to a spline within a curve object
+      if (render_as_hair)
+        shader = CData->curve_shader[curve];
+      else 
+        shader = CData->psys_shader[sys];
+
+      mesh->add_curve(num_keys, shader);
       num_keys += num_curve_keys;
       num_curves++;
     }
@@ -678,13 +1098,21 @@ static float4 CurveSegmentMotionCV(ParticleCurveData *CData, int sys, int curve,
   const float curve_time = CData->curvekey_time[curvekey];
   const float curve_length = CData->curve_length[curve];
   float time = (curve_length > 0.0f) ? curve_time / curve_length : 0.0f;
-  float radius = shaperadius(
+  float radius;
+  bool render_as_hair = false;
+  if (CData->render_as_hair.size() > sys)
+    render_as_hair = CData->render_as_hair[sys];
+  if (render_as_hair) {
+      radius = CData->curvekey_radius[curvekey];
+  }
+  else {
+    radius = shaperadius(
       CData->psys_shape[sys], CData->psys_rootradius[sys], CData->psys_tipradius[sys], time);
 
-  if (CData->psys_closetip[sys] &&
-      (curvekey == CData->curve_firstkey[curve] + CData->curve_keynum[curve] - 1))
-    radius = 0.0f;
-
+    if (CData->psys_closetip[sys] &&
+        (curvekey == CData->curve_firstkey[curve] + CData->curve_keynum[curve] - 1))
+      radius = 0.0f;
+  }
   /* curve motion keys store both position and radius in float4 */
   float4 mP = float3_to_float4(ickey_loc);
   mP.w = radius;
@@ -993,9 +1421,21 @@ void BlenderSync::sync_curves(
 
   /* extract particle hair data - should be combined with connecting to mesh later*/
 
+  BL::ID b_ob_data = b_ob.data();
+  bool render_as_hair = false;
+
+  // [Nicolas Antille] : cycles_curves is here a property of the Curve data 
+  if(!b_ob_data || b_ob_data.is_a(&RNA_Curve)) {
+    PointerRNA data = RNA_pointer_get(&b_ob_data.ptr, "cycles_curves");
+    render_as_hair = get_boolean(data, "render_as_hair");
+  }
+
   ParticleCurveData CData;
 
-  ObtainCacheParticleData(mesh, &b_mesh, &b_ob, &CData, !preview);
+  if (render_as_hair)
+    ObtainCurveData(mesh, &b_mesh, &b_ob, &CData, !preview);
+  else
+    ObtainCacheParticleData(mesh, &b_mesh, &b_ob, &CData, !preview);
 
   /* add hair geometry to mesh */
   if (primitive == CURVE_TRIANGLES) {
@@ -1029,7 +1469,7 @@ void BlenderSync::sync_curves(
 
   /* generated coordinates from first key. we should ideally get this from
    * blender to handle deforming objects */
-  if (!motion) {
+  if (!motion && !render_as_hair) {
     if (mesh->need_attribute(scene, ATTR_STD_GENERATED)) {
       float3 loc, size;
       mesh_texture_space(b_mesh, loc, size);
@@ -1054,7 +1494,7 @@ void BlenderSync::sync_curves(
   }
 
   /* create vertex color attributes */
-  if (!motion) {
+  if (!motion && !render_as_hair) {
     BL::Mesh::vertex_colors_iterator l;
     int vcol_num = 0;
 
@@ -1091,7 +1531,7 @@ void BlenderSync::sync_curves(
   }
 
   /* create UV attributes */
-  if (!motion) {
+  if (!motion && !render_as_hair) {
     BL::Mesh::uv_layers_iterator l;
     int uv_num = 0;
 

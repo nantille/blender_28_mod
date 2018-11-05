@@ -4325,6 +4325,13 @@ NODE_DEFINE(HairInfoNode)
   SOCKET_OUT_FLOAT(fade, "Fade");
 #endif
   SOCKET_OUT_FLOAT(index, "Random");
+  SOCKET_OUT_FLOAT(curve_index, "Spline Index");
+  SOCKET_OUT_FLOAT(curve_count, "Splines Count");
+  SOCKET_OUT_FLOAT(curve_length, "Spline Length");
+  SOCKET_OUT_FLOAT(curve_key, "Custom Key Data");
+  SOCKET_OUT_FLOAT(curve_value, "Custom Value Data");
+  SOCKET_OUT_VECTOR(normal, "Normal");
+  SOCKET_OUT_VECTOR(uv, "UV");
 
   return type;
 }
@@ -4341,8 +4348,23 @@ void HairInfoNode::attributes(Shader *shader, AttributeRequestSet *attributes)
     if (!intercept_out->links.empty())
       attributes->add(ATTR_STD_CURVE_INTERCEPT);
 
-    if (!output("Random")->links.empty())
+    if(!output("Random")->links.empty())
       attributes->add(ATTR_STD_CURVE_RANDOM);
+
+    if(!output("Spline Index")->links.empty())
+      attributes->add(ATTR_STD_CURVE_INDEX);
+
+    if(!output("Splines Count")->links.empty())
+      attributes->add(ATTR_STD_CURVE_COUNT);
+
+    if(!output("Spline Length")->links.empty())
+      attributes->add(ATTR_STD_CURVE_LENGTH);
+
+    if(!output("Custom Key Data")->links.empty())
+      attributes->add(ATTR_STD_CURVE_KEY);
+
+    if(!output("Custom Value Data")->links.empty())
+      attributes->add(ATTR_STD_CURVE_VALUE);
   }
 
   ShaderNode::attributes(shader, attributes);
@@ -4379,8 +4401,38 @@ void HairInfoNode::compile(SVMCompiler &compiler)
   }*/
 
   out = output("Random");
-  if (!out->links.empty()) {
+  if(!out->links.empty()) {
     int attr = compiler.attribute(ATTR_STD_CURVE_RANDOM);
+    compiler.add_node(NODE_ATTR, attr, compiler.stack_assign(out), NODE_ATTR_FLOAT);
+  }
+
+  out = output("Spline Index");
+  if(!out->links.empty()) {
+    int attr = compiler.attribute(ATTR_STD_CURVE_INDEX);
+    compiler.add_node(NODE_ATTR, attr, compiler.stack_assign(out), NODE_ATTR_FLOAT);
+  }
+
+  out = output("Splines Count");
+  if(!out->links.empty()) {
+    int attr = compiler.attribute(ATTR_STD_CURVE_COUNT);
+    compiler.add_node(NODE_ATTR, attr, compiler.stack_assign(out), NODE_ATTR_FLOAT);
+  }
+
+  out = output("Spline Length");
+  if(!out->links.empty()) {
+    int attr = compiler.attribute(ATTR_STD_CURVE_LENGTH);
+    compiler.add_node(NODE_ATTR, attr, compiler.stack_assign(out), NODE_ATTR_FLOAT);
+  }
+
+  out = output("Custom Key Data");
+  if(!out->links.empty()) {
+    int attr = compiler.attribute(ATTR_STD_CURVE_KEY);
+    compiler.add_node(NODE_ATTR, attr, compiler.stack_assign(out), NODE_ATTR_FLOAT);
+  }
+
+  out = output("Custom Value Data");
+  if(!out->links.empty()) {
+    int attr = compiler.attribute(ATTR_STD_CURVE_VALUE);
     compiler.add_node(NODE_ATTR, attr, compiler.stack_assign(out), NODE_ATTR_FLOAT);
   }
 }

@@ -70,7 +70,12 @@ class ParticleCurveData {
   array<float> psys_tipradius;
   array<float> psys_shape;
   array<bool> psys_closetip;
+    
+  array<bool> render_as_hair;
+  array<bool> use_curve_radii;
 
+  // One shader per spline using its material_index
+  array<int> curve_shader;
   array<int> curve_firstkey;
   array<int> curve_keynum;
   array<float> curve_length;
@@ -79,6 +84,10 @@ class ParticleCurveData {
 
   array<float3> curvekey_co;
   array<float> curvekey_time;
+  array<float> curvekey_radius;
+  // Custom key-value data pair for each point
+  array<float> curvekey_key;
+  array<float> curvekey_value;
 };
 
 /* HairSystem Manager */

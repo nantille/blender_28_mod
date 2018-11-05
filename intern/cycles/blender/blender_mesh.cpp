@@ -1072,9 +1072,8 @@ Mesh *BlenderSync::sync_mesh(BL::Depsgraph &b_depsgraph,
 
     /* For some reason, meshes do not need this... */
     bool need_undeformed = mesh->need_attribute(scene, ATTR_STD_GENERATED);
-
-    BL::Mesh b_mesh = object_to_mesh(
-        b_data, b_ob, b_depsgraph, need_undeformed, mesh->subdivision_type);
+      
+    BL::Mesh b_mesh = object_to_mesh(b_data, b_ob, b_depsgraph, need_undeformed, mesh->subdivision_type);
 
     if (b_mesh) {
       /* Sync mesh itself. */
@@ -1087,15 +1086,24 @@ Mesh *BlenderSync::sync_mesh(BL::Depsgraph &b_depsgraph,
         create_mesh_volume_attributes(scene, b_ob, mesh, b_scene.frame_current());
       }
 
+      bool render_as_hair = false;
+      // [Nicolas Antille] : cycles_curves is here a property of the Curve data 
+      if(!b_ob_data || b_ob_data.is_a(&RNA_Curve)) {
+        PointerRNA cycles_curves = RNA_pointer_get(&b_ob_data.ptr, "cycles_curves");
+        render_as_hair = get_boolean(cycles_curves, "render_as_hair");
+      }
+
       /* Sync hair curves. */
-      if (view_layer.use_hair && show_particles &&
-          mesh->subdivision_type == Mesh::SUBDIVISION_NONE) {
+      if ((view_layer.use_hair && show_particles &&
+          mesh->subdivision_type == Mesh::SUBDIVISION_NONE) || render_as_hair) {
+          
         sync_curves(mesh, b_mesh, b_ob, false);
       }
 
       free_object_to_mesh(b_data, b_ob, b_mesh);
     }
   }
+
   mesh->geometry_flags = requested_geometry_flags;
 
   /* mesh fluid motion mantaflow */

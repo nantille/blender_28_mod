@@ -294,6 +294,16 @@ const char *Attribute::standard_name(AttributeStandard std)
       return "curve_intercept";
     case ATTR_STD_CURVE_RANDOM:
       return "curve_random";
+    case ATTR_STD_CURVE_INDEX:
+        return "curve_index";
+    case ATTR_STD_CURVE_COUNT:
+        return "curve_count";
+    case ATTR_STD_CURVE_LENGTH:
+        return "curve_length";
+    case ATTR_STD_CURVE_KEY:
+        return "curve_key";
+    case ATTR_STD_CURVE_VALUE:
+        return "curve_value";
     case ATTR_STD_PTEX_FACE_ID:
       return "ptex_face_id";
     case ATTR_STD_PTEX_UV:
@@ -494,6 +504,22 @@ Attribute *AttributeSet::add(AttributeStandard std, ustring name)
         break;
       case ATTR_STD_CURVE_RANDOM:
         attr = add(name, TypeDesc::TypeFloat, ATTR_ELEMENT_CURVE);
+        break;
+      case ATTR_STD_CURVE_INDEX:
+        attr = add(name, TypeDesc::TypeFloat, ATTR_ELEMENT_CURVE);
+        break;
+      case ATTR_STD_CURVE_COUNT:
+        attr = add(name, TypeDesc::TypeFloat, ATTR_ELEMENT_CURVE);
+        break;
+      case ATTR_STD_CURVE_LENGTH:
+        attr = add(name, TypeDesc::TypeFloat, ATTR_ELEMENT_CURVE);
+        break;
+      case ATTR_STD_CURVE_KEY:
+        // Watch out, ATTR_STD_CURVE_KEY is for custom (key) data while ATTR_ELEMENT_CURVE_KEY describes a point
+        attr = add(name, TypeDesc::TypeFloat, ATTR_ELEMENT_CURVE_KEY);
+        break;
+      case ATTR_STD_CURVE_VALUE:
+        attr = add(name, TypeDesc::TypeFloat, ATTR_ELEMENT_CURVE_KEY);
         break;
       case ATTR_STD_GENERATED_TRANSFORM:
         attr = add(name, TypeDesc::TypeMatrix, ATTR_ELEMENT_MESH);

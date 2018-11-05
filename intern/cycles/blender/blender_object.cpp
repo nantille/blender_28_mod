@@ -69,8 +69,20 @@ bool BlenderSync::object_is_mesh(BL::Object &b_ob)
 
   if (b_ob.type() == BL::Object::type_CURVE) {
     /* Skip exporting curves without faces, overhead can be
-     * significant if there are many for path animation. */
+     * significant if there are many for path animation. 
+     ------------------------------------------------------
+     Modification: [Nicolas Antille] 
+     Except if we want to render these curves as hair*/
     BL::Curve b_curve(b_ob.data());
+
+    bool render_as_hair = false;
+    // [Nicolas Antille] : cycles_curves is here a property of the Curve data 
+    PointerRNA cycles_curves = RNA_pointer_get(&b_ob_data.ptr, "cycles_curves");
+    render_as_hair = get_boolean(cycles_curves, "render_as_hair");
+    if (render_as_hair) {
+      // Render the curve as hair even if it has has no bevel or extrusion (meshless mode)
+      return true;
+    }
 
     return (b_curve.bevel_object() || b_curve.extrude() != 0.0f || b_curve.bevel_depth() != 0.0f ||
             b_curve.dimensions() == BL::Curve::dimensions_2D || b_ob.modifiers.length());

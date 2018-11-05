@@ -1335,6 +1335,27 @@ class CYCLES_OBJECT_PT_visibility_culling(CyclesButtonsPanel, Panel):
         col = flow.column()
         col.active = scene.render.use_simplify and cscene.use_distance_cull
         col.prop(cob, "use_distance_cull")
+        
+
+class CYCLES_CURVE_PT_hair_settings(CyclesButtonsPanel, Panel):
+    bl_label = "Render curve as hair"
+    bl_context = "data"
+    #bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        ob = context.object
+        return CyclesButtonsPanel.poll(context) and ob is not None and ob.type == 'CURVE'
+
+    def draw_header(self, context):
+        ob = context.object
+        self.layout.prop(ob.data.cycles_curves, "render_as_hair", text="Render as hair")
+
+    def draw(self, context):
+        layout = self.layout
+        ob = context.object
+        cc = ob.data.cycles_curves
+        layout.active = cc.render_as_hair
 
 
 def panel_node_draw(layout, id_data, output_type, input_name):
@@ -2292,6 +2313,7 @@ classes = (
     CYCLES_OBJECT_PT_visibility,
     CYCLES_OBJECT_PT_visibility_ray_visibility,
     CYCLES_OBJECT_PT_visibility_culling,
+    CYCLES_CURVE_PT_hair_settings,
     CYCLES_LIGHT_PT_preview,
     CYCLES_LIGHT_PT_light,
     CYCLES_LIGHT_PT_nodes,

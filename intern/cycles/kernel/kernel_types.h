@@ -763,6 +763,11 @@ typedef enum AttributeStandard {
   ATTR_STD_PARTICLE,
   ATTR_STD_CURVE_INTERCEPT,
   ATTR_STD_CURVE_RANDOM,
+  ATTR_STD_CURVE_INDEX,
+  ATTR_STD_CURVE_COUNT,
+  ATTR_STD_CURVE_LENGTH,
+  ATTR_STD_CURVE_KEY,
+  ATTR_STD_CURVE_VALUE,
   ATTR_STD_PTEX_FACE_ID,
   ATTR_STD_PTEX_UV,
   ATTR_STD_VOLUME_DENSITY,
@@ -940,6 +945,7 @@ typedef ccl_addr_space struct ccl_align(16) ShaderData
   float3 Ng;
   /* view/incoming direction */
   float3 I;
+
   /* shader id */
   int shader;
   /* booleans describing shader, see ShaderDataFlag */

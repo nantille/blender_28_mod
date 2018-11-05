@@ -992,7 +992,7 @@ void Session::update_status_time(bool show_pause, bool show_done)
     status = "Rendering Paused";
   }
   else if (show_done) {
-    status = "Rendering Done";
+    status = "Rendering Done." + substatus;
     progress.set_end_time(); /* Save end time so that further calls to get_time are accurate. */
   }
   else {
