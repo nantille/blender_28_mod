@@ -1340,7 +1340,7 @@ class CYCLES_OBJECT_PT_visibility_culling(CyclesButtonsPanel, Panel):
 class CYCLES_CURVE_PT_hair_settings(CyclesButtonsPanel, Panel):
     bl_label = "Render curve as hair"
     bl_context = "data"
-    #bl_options = {'DEFAULT_CLOSED'}
+    bl_options = {'DEFAULT_CLOSED'}
 
     @classmethod
     def poll(cls, context):
@@ -1350,12 +1350,18 @@ class CYCLES_CURVE_PT_hair_settings(CyclesButtonsPanel, Panel):
     def draw_header(self, context):
         ob = context.object
         self.layout.prop(ob.data.cycles_curves, "render_as_hair", text="Render as hair")
-
+        
     def draw(self, context):
         layout = self.layout
         ob = context.object
         cc = ob.data.cycles_curves
         layout.active = cc.render_as_hair
+
+        col = self.layout.column()
+        col.separator()
+        col.prop(ob.data.cycles_curves, "use_key_as_branch_order", text="Use key data as branch order", expand=True)
+        col.prop(ob.data.cycles_curves, "reveal_affects_intercept", text="Bevel end affects HairInfo.Intercept", expand=True)
+        col.separator()
 
 
 def panel_node_draw(layout, id_data, output_type, input_name):

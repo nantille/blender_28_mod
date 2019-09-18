@@ -1163,14 +1163,14 @@ class CyclesObjectSettings(bpy.types.PropertyGroup):
         "compositing with real footage or another render",
         default=False,
     )
-    
+    '''
     # [Nicolas Antille] Feature: render curves as hair
     render_curves_as_hair: BoolProperty(
         name="Render curves as hair",
         description="Render all splines within this curve object as Cycles hair",
         default=False
     )
-
+    '''
     @classmethod
     def register(cls):
         bpy.types.Object.cycles = PointerProperty(
@@ -1183,13 +1183,25 @@ class CyclesObjectSettings(bpy.types.PropertyGroup):
     def unregister(cls):
         del bpy.types.Object.cycles
 
-        
+
+# [Nicolas Antille] Extension of Cycles to make curves renderable as hair
 class CyclesCurveHairSettings(bpy.types.PropertyGroup):
     
-    # [Nicolas Antille] Feature: render curves as hair
     render_as_hair: BoolProperty(
         name="Render curves as hair",
         description="Render all splines within this curve object as Cycles hair so that you don't need to mesh/bevel them in the viewport",
+        default=False
+    )
+    # Use custom data called "key" to retrieve information about tree branch order (useful for growing graph/tree datasets with bevel_end property)
+    use_key_as_branch_order: BoolProperty(
+        name="Use key custom data as order for spline reveal",
+        description="Use key data as branch order (works with reveal property)",
+        default=False
+    )
+    # Make bevel end property a factor of HairInfo.Intercept value
+    reveal_affects_intercept: BoolProperty(
+        name="Bevel end affects intercept",
+        description="Make intercept value depend on bevel end factor",
         default=False
     )
     

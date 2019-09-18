@@ -27,6 +27,8 @@
 #include "util/util_foreach.h"
 #include "util/util_hash.h"
 #include "util/util_logging.h"
+#include <numeric>
+#include <iterator>
 
 CCL_NAMESPACE_BEGIN
 
@@ -166,19 +168,21 @@ static bool ObtainCurveData(Mesh *mesh,
 		return false;
 
 	bool render_as_hair = false;
-  float reveal_amount = 1.0f;
+  bool use_key_as_branch_order = false;
+  bool reveal_affects_intercept = false;
+  float bevel_factor_end = 1.0f;
 	if(!b_ob_data || b_ob_data.is_a(&RNA_Curve)) 
   {
     // "cycles_curves" is here a property of the Curve data 
 		PointerRNA cycles_curves = RNA_pointer_get(&b_ob_data.ptr, "cycles_curves");
 		render_as_hair = get_boolean(cycles_curves, "render_as_hair");
-    reveal_amount = b_curve.bevel_factor_end();
+    bevel_factor_end = b_curve.bevel_factor_end();
+		use_key_as_branch_order = get_boolean(cycles_curves, "use_key_as_branch_order");
+		reveal_affects_intercept = get_boolean(cycles_curves, "reveal_affects_intercept");
+		//wiggle = get_boolean(cycles_curves, "wiggle");
 	}
 
-  if (reveal_amount == 0.0f)
-    return false;
-
-	if(!render_as_hair)
+	if(!render_as_hair || bevel_factor_end <= 0.0f)
     return false;
 
 	CData->psys_firstcurve.push_back_slow(0);
@@ -190,29 +194,39 @@ static bool ObtainCurveData(Mesh *mesh,
   CData->curve_length.reserve(num_splines);
   CData->curve_firstkey.reserve(num_splines);
   
-  //vector<float> curves_entire_length;
-  //curves_entire_length.reserve(num_splines);
-  float all_curves_length = 0.0;
-  float max_curve_length = 0.0;
-  
-  // Computing lengths beforehand so that we can stop adding points if the user chose 
-  // to reveal only parts of the splines.
+  vector<double> orders_lengths;
+  orders_lengths.push_back(0.0);
+
+  vector<float> curves_lengths;
+  curves_lengths.reserve(num_splines);
+
+  float max_order = 0.0f;
+  double all_curves_length = 0.0;
+  double max_curve_length = 0.0;
+  // Precalculation of lengths and branches orders necessary for bevel_factor_end() feature.
   for(int spline = 0; spline < num_splines; ++spline) 
   {
     BL::Spline b_spline = b_curve.splines[spline];
     const bool is_bezier = (b_spline.type() == BL::Spline::type_BEZIER);
     const int num_points = is_bezier ? b_spline.bezier_points.length() : b_spline.points.length();
-
-		float curve_length = 0.0f;
-		float3 prev_co;
-    for(int point = 0; point <= num_points-1; ++point) 
+      
+    float curve_length = 0.0f;
+    float3 prev_co;
+    for(int point = 0; point <= num_points-1; ++point)
     {
       if(is_bezier)
       {
         BL::BezierSplinePoint b_curr_point = b_spline.bezier_points[point];
 
         const float3 co = get_float3(b_curr_point.co());
-        if(point != 0) 
+        if (use_key_as_branch_order)
+        {
+          const float key = b_curr_point.key();
+          const int order = std::floor(key);
+          if (max_order < order)
+              max_order = order;
+        }
+        if(point != 0)
         {
           const float step_length = len(co - prev_co);
           if(step_length == 0.0f)
@@ -227,7 +241,14 @@ static bool ObtainCurveData(Mesh *mesh,
 
         // Forced to duplicate code here, there's no abstract class for BezierSplinePoint and SplinePoint
         const float3 co = get_float3(b_curr_point.co());
-        if(point != 0) 
+        if (use_key_as_branch_order)
+        {
+          const float key = b_curr_point.key();
+          const int order = std::floor(key);
+          if (max_order < order)
+              max_order = order;
+        }
+        if(point != 0)
         {
           const float step_length = len(co - prev_co);
           if(step_length == 0.0f)
@@ -239,17 +260,15 @@ static bool ObtainCurveData(Mesh *mesh,
     }
     if (max_curve_length < curve_length)
         max_curve_length = curve_length;
+    curves_lengths[spline] = curve_length;
     all_curves_length += curve_length;
-    //curves_entire_length.push_back(curve_length);
   }
-  //double max_length = *max_element(curves_entire_length.begin(), curves_entire_length.end());
 
-  const float reveal_threshold = all_curves_length * reveal_amount;
-  float current_curves_length = 0.0f;
+  double current_curves_lengths = 0.0;
 	int keyno = 0;
   // Variables refer to splines here as this is really what you have in the UI.
   // In Cycles code, splines are curves and curves are "psys" or particle systems.
-	for(int spline = 0; spline < num_splines; ++spline) 
+	for(int spline = 0; spline < num_splines; ++spline)
   {
 		BL::Spline b_spline = b_curve.splines[spline];
     const bool is_bezier = (b_spline.type() == BL::Spline::type_BEZIER);
@@ -277,26 +296,49 @@ static bool ObtainCurveData(Mesh *mesh,
 		int keynum = 0;
 		float curve_length = 0.0f;
 		float3 prev_co;
+    
+    float curve_order_length = 0.0f;
+    int current_order = -1;
 
     // When resolution equals 1, no interpolation is performed, we directly copy the given data
     if (resolution == 1)
     {
-      for(int point = 0; point <= num_points-1; ++point) 
+      for(int point = 0; point <= num_points-1; ++point)
       {
         if(is_bezier) 
         {
           BL::BezierSplinePoint b_curr_point = b_spline.bezier_points[point];
 
           const float3 co = get_float3(b_curr_point.co());
-          if(point != 0) 
+          const float key = b_curr_point.key();
+          const int order = std::floor(key);
+          if(point != 0)
           {
             const float step_length = len(co - prev_co);
             if(step_length == 0.0f)
               continue;
+            curve_order_length += step_length;
+            if(use_key_as_branch_order && bevel_factor_end < 1.0f)
+            {
+              if (current_order == -1)
+                current_order = order;
+              if(order > current_order)
+                curve_order_length = step_length;
+              current_order = order;
+              //if(order > order_threshold)// || bevel_factor_end < domain_start)
+                //break;
+              const double overestimated_cumulated_length = 1.0 * max_curve_length * (max_order + 1);
+              const double threshold = bevel_factor_end * (overestimated_cumulated_length);
+              const double current_length = max_curve_length * order + curve_order_length;
+              if (current_length >= threshold)
+                break;
+            }
+            else if(!use_key_as_branch_order && bevel_factor_end < 1.0f)
+            {
+              if (current_curves_lengths + curve_length > all_curves_length * bevel_factor_end || bevel_factor_end == 0.0f)
+                break;
+            }
             curve_length += step_length;
-            current_curves_length += step_length;
-            if(reveal_amount < 1.0f && current_curves_length > reveal_threshold)
-              break;
           }
           CData->curvekey_co.push_back_slow(co);
           CData->curvekey_radius.push_back_slow(b_curr_point.radius());
@@ -304,36 +346,63 @@ static bool ObtainCurveData(Mesh *mesh,
           CData->curvekey_key.push_back_slow(b_curr_point.key());
           CData->curvekey_value.push_back_slow(b_curr_point.value());
           prev_co = co;
-          }
-          else
-          {
-            BL::SplinePoint b_curr_point = b_spline.points[point];
+        }
+        else
+        {
+          BL::SplinePoint b_curr_point = b_spline.points[point];
 
-            // Forced to duplicate code here, there's no abstract class for BezierSplinePoint and SplinePoint
-            const float3 co = get_float3(b_curr_point.co());
-            if(point != 0) 
+          // Duplicating code as there's no abstract class for BezierSplinePoint and SplinePoint
+          const float3 co = get_float3(b_curr_point.co());
+          const float key = b_curr_point.key();
+          const int order = std::floor(key);
+          if(point != 0)
+          {
+            const float step_length = len(co - prev_co);
+            if(step_length == 0.0f)
+              continue;
+            curve_order_length += step_length;
+            if(use_key_as_branch_order && bevel_factor_end < 1.0f)
             {
-              const float step_length = len(co - prev_co);
-              if(step_length == 0.0f)
-                continue;
-              curve_length += step_length;
-              current_curves_length += step_length;
-              if(reveal_amount < 1.0f && current_curves_length > reveal_threshold)
+              if (current_order == -1)
+                current_order = order;
+              if(order > current_order)
+                curve_order_length = step_length;
+              current_order = order;
+              //if(order > order_threshold)// || bevel_factor_end < domain_start)
+                //break;
+              const double overestimated_cumulated_length = 1.0 * max_curve_length * (max_order + 1);
+              const double threshold = bevel_factor_end * (overestimated_cumulated_length);
+              const double current_length = max_curve_length * order + curve_order_length;
+              if (current_length >= threshold)
                 break;
             }
-            CData->curvekey_co.push_back_slow(co);
-            CData->curvekey_radius.push_back_slow(b_curr_point.radius());
-            CData->curvekey_time.push_back_slow(curve_length);
-            CData->curvekey_key.push_back_slow(b_curr_point.key());
-            CData->curvekey_value.push_back_slow(b_curr_point.value());
-            prev_co = co;
+            else if(!use_key_as_branch_order && bevel_factor_end < 1.0f)
+            {
+              if (current_curves_lengths + curve_length > all_curves_length * bevel_factor_end || bevel_factor_end == 0.0f)
+                break;
+            }
+            curve_length += step_length;
           }
+          CData->curvekey_co.push_back_slow(co);
+          CData->curvekey_radius.push_back_slow(b_curr_point.radius());
+          CData->curvekey_time.push_back_slow(curve_length);
+          CData->curvekey_key.push_back_slow(b_curr_point.key());
+          CData->curvekey_value.push_back_slow(b_curr_point.value());
+          prev_co = co;
         }
+        float real_curve_length = curve_length;
+        current_curves_lengths += curve_length;
+        if(reveal_affects_intercept)
+          real_curve_length = curves_lengths[spline];
         CData->curve_keynum.push_back_slow(num_points);
-        CData->curve_length.push_back_slow(curve_length);
+        CData->curve_length.push_back_slow(real_curve_length);
         continue;
       }
-        
+    }
+
+    // Below if for cases where interpolation between spline points occurs
+    // -------------------------------------------------------------------
+
     // Interpolation of given spline points when resolution larger than 1
     for(int point = 0; point < num_points - 1; ++point) 
     {
@@ -382,7 +451,6 @@ static bool ObtainCurveData(Mesh *mesh,
             BL::SplinePoint b_second_next_point = b_spline.points[point+2];
             ckey_loc4 = get_float3(b_second_next_point.co());
           }
-
           float weights[4];
           interp_weights((float)i / (float)resolution, weights);
 
@@ -397,39 +465,69 @@ static bool ObtainCurveData(Mesh *mesh,
         }
       }
 
-      // Store the interpolated values
+      const bool beyond_lengths_reveal = current_curves_lengths > all_curves_length * bevel_factor_end;
+      if(!use_key_as_branch_order && bevel_factor_end < 1.0f && beyond_lengths_reveal)
+        break;
+
       for (int interp_i = 0; interp_i <= resolution; ++interp_i) 
       {
         const float3 co = points[interp_i];
         const float radius = radii[interp_i];
-        const float custom_data_key = custom_data_keys[interp_i];
-        const float custom_data_value = custom_data_values[interp_i];
-
+        const float key = custom_data_keys[interp_i];
+        const float value = custom_data_values[interp_i];
+        const int order = std::floor(key);
+        
         if(!(point == 0 && interp_i == 0)) 
         {
           const float step_length = len(co - prev_co);
           if(step_length == 0.0f)
             continue;
-          curve_length += step_length;
-          current_curves_length += step_length;
-          if(reveal_amount < 1.0f && current_curves_length > reveal_threshold)
+          curve_order_length += step_length;
+          if(use_key_as_branch_order && bevel_factor_end < 1.0f)
+          {
+            if (current_order == -1)
+              current_order = order;
+            if(order > current_order)
+              curve_order_length = step_length;
+            current_order = order;
+            //if(order > order_threshold)// || bevel_factor_end < domain_start)
+              //break;
+            const double overestimated_cumulated_length = 1.0 * max_curve_length * (max_order + 1);
+            const double threshold = bevel_factor_end * (overestimated_cumulated_length);
+            const double current_length = max_curve_length * order + curve_order_length;
+            if (current_length >= threshold)
               break;
+          }
+          else if(!use_key_as_branch_order && bevel_factor_end < 1.0f)
+          {
+            if (current_curves_lengths + curve_length > all_curves_length * bevel_factor_end || bevel_factor_end == 0.0f)
+              break;
+          }
+          curve_length += step_length;
         }
         CData->curvekey_co.push_back_slow(co);
         CData->curvekey_radius.push_back_slow(radius);
         CData->curvekey_time.push_back_slow(curve_length);
-        CData->curvekey_key.push_back_slow(custom_data_key);
-        CData->curvekey_value.push_back_slow(custom_data_value);
+        CData->curvekey_key.push_back_slow(key);
+        CData->curvekey_value.push_back_slow(value);
 
         prev_co = co;
         ++keynum;
 			}
 		}
 		keyno += keynum;
-
+    current_curves_lengths += curve_length;
+    float real_curve_length = curves_lengths[spline];
+    if(reveal_affects_intercept)
+      real_curve_length = curve_length;
 		CData->curve_keynum.push_back_slow(keynum);
-		CData->curve_length.push_back_slow(curve_length);
+		CData->curve_length.push_back_slow(real_curve_length);
 	}
+  /*
+  std::cout << "------" << std::endl;
+  std::cout << " " << std::endl;
+  std::cout << " " << std::endl;
+  */
 	return true;
 }
     
