@@ -1361,6 +1361,10 @@ class CYCLES_CURVE_PT_hair_settings(CyclesButtonsPanel, Panel):
         col.separator()
         col.prop(ob.data.cycles_curves, "use_key_as_branch_order", text="Use key data as branch order", expand=True)
         col.prop(ob.data.cycles_curves, "reveal_affects_intercept", text="Bevel end affects HairInfo.Intercept", expand=True)
+        col.prop(ob.data.cycles_curves, "points_displacement", text="Displace curve points", expand=True)
+        col.prop(ob.data.cycles_curves, "radii_displacement", text="Displace curve radii", expand=True)
+        col.prop(ob.data.cycles_curves, "additive_radii_displacement", text="Additive radii displacement only", expand=True)
+        col.prop(ob.data.cycles_curves, "displacement_time", text="Displacement time", expand=True)
         col.separator()
 
 

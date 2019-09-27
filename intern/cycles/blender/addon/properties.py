@@ -1204,6 +1204,33 @@ class CyclesCurveHairSettings(bpy.types.PropertyGroup):
         description="Make intercept value depend on bevel end factor",
         default=False
     )
+    # Displace curve
+    points_displacement: FloatProperty(
+        name="Curve points displacement",
+        description="Displacement value applied on each point XYZ",
+        min=-100000000.0, max=100000000.0, soft_min=0.0,
+        default=0.0
+    )
+    # Displace radii
+    radii_displacement: FloatProperty(
+        name="Curve radii displacement",
+        description="Displacement value applied on each point radius",
+        min=-100000000.0, max=100000000.0, soft_min=0.0,
+        default=0.0
+    )
+    # Displace radii
+    additive_radii_displacement: BoolProperty(
+        name="Additive radii displacement only",
+        description="Apply only positive displacement to radii values",
+        default=True
+    )
+    # Displacement time fpr above features
+    displacement_time: FloatProperty(
+        name="Displacement time",
+        description="Animate displacement by changing the time",
+        min=-100000000.0, max=100000000.0, soft_min=0.0,
+        default=0.0
+    )
     
     @classmethod
     def register(cls):

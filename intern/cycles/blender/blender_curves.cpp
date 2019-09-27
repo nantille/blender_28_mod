@@ -141,13 +141,21 @@ static void forward_diff_bezier(const float3& q0,
 This is the transition part. We get data from Blender and prepare it for Cycles.
 Here, we handle splines and curve data. Be warned about variable names: 
 in C/C++ sources of Cycles, "curve" describes both curve objects and splines (!).
-Also, custom data was added to SplinePoint and BezierSplinePoint, namely "key" and "value",
-two 4 byte float that can store custom data that will be reflected and available in
-HairInfo node as HairInfo.Key and HairInfo.Value.
-Some of the features that are supported here:
+
+In the list of new features, we have:
+- curve objects and splines renderable as hair primitives
+- radii data per spline control points affect the shape of the hair
+- interpolation for all curve types, there is also an interpolation-less mode
+- custom data added to SplinePoint and BezierSplinePoint, namely "key" and "value",
+two 4 byte floats that can store custom data that are available in HairInfo node as 
+HairInfo.Key and HairInfo.Value. 
 - per spline materials using material_index attribute
-- proper nurbs and bezier interpolations
-- resolution == 1 makes a copy of raw data without interp, which is faster
+- growing curves with bevel end feature
+- option to make tree growth mode using custom key data that defines branch order
+- option to make intercept value affected by bevel end
+- option to add noise to curve points
+- option to add noise to curve radii
+- extra HairInfo slots: Spline Index, Splines Count, Spline Length, Custom Key Data, Custom Value Data
 */
 static bool ObtainCurveData(Mesh *mesh,
                             BL::Mesh *b_mesh,
@@ -171,6 +179,10 @@ static bool ObtainCurveData(Mesh *mesh,
   bool use_key_as_branch_order = false;
   bool reveal_affects_intercept = false;
   float bevel_factor_end = 1.0f;
+  float points_displacement = 0.0f;
+  float radii_displacement = 0.0f;
+  bool additive_radii_displacement = false;
+  float displacement_time = 0.0f;
 	if(!b_ob_data || b_ob_data.is_a(&RNA_Curve)) 
   {
     // "cycles_curves" is here a property of the Curve data 
@@ -179,7 +191,10 @@ static bool ObtainCurveData(Mesh *mesh,
     bevel_factor_end = b_curve.bevel_factor_end();
 		use_key_as_branch_order = get_boolean(cycles_curves, "use_key_as_branch_order");
 		reveal_affects_intercept = get_boolean(cycles_curves, "reveal_affects_intercept");
-		//wiggle = get_boolean(cycles_curves, "wiggle");
+		points_displacement = get_float(cycles_curves, "points_displacement");
+		radii_displacement = get_float(cycles_curves, "radii_displacement");
+		additive_radii_displacement = get_boolean(cycles_curves, "additive_radii_displacement");
+		displacement_time = get_float(cycles_curves, "displacement_time");
 	}
 
 	if(!render_as_hair || bevel_factor_end <= 0.0f)
@@ -194,15 +209,15 @@ static bool ObtainCurveData(Mesh *mesh,
   CData->curve_length.reserve(num_splines);
   CData->curve_firstkey.reserve(num_splines);
   
-  vector<double> orders_lengths;
-  orders_lengths.push_back(0.0);
+  vector<float> orders_lengths;
+  orders_lengths.push_back(0.0f);
 
   vector<float> curves_lengths;
   curves_lengths.reserve(num_splines);
 
   float max_order = 0.0f;
-  double all_curves_length = 0.0;
-  double max_curve_length = 0.0;
+  float all_curves_length = 0.0f;
+  float max_curve_length = 0.0f;
   // Precalculation of lengths and branches orders necessary for bevel_factor_end() feature.
   for(int spline = 0; spline < num_splines; ++spline) 
   {
@@ -222,7 +237,7 @@ static bool ObtainCurveData(Mesh *mesh,
         if (use_key_as_branch_order)
         {
           const float key = b_curr_point.key();
-          const int order = std::floor(key);
+          const int order = (int) std::floor(key);
           if (max_order < order)
               max_order = order;
         }
@@ -244,7 +259,7 @@ static bool ObtainCurveData(Mesh *mesh,
         if (use_key_as_branch_order)
         {
           const float key = b_curr_point.key();
-          const int order = std::floor(key);
+          const int order = (int) std::floor(key);
           if (max_order < order)
               max_order = order;
         }
@@ -264,7 +279,7 @@ static bool ObtainCurveData(Mesh *mesh,
     all_curves_length += curve_length;
   }
 
-  double current_curves_lengths = 0.0;
+  float current_curves_lengths = 0.0f;
 	int keyno = 0;
   // Variables refer to splines here as this is really what you have in the UI.
   // In Cycles code, splines are curves and curves are "psys" or particle systems.
@@ -311,7 +326,7 @@ static bool ObtainCurveData(Mesh *mesh,
 
           const float3 co = get_float3(b_curr_point.co());
           const float key = b_curr_point.key();
-          const int order = std::floor(key);
+          const int order = (int) std::floor(key);
           if(point != 0)
           {
             const float step_length = len(co - prev_co);
@@ -327,9 +342,9 @@ static bool ObtainCurveData(Mesh *mesh,
               current_order = order;
               //if(order > order_threshold)// || bevel_factor_end < domain_start)
                 //break;
-              const double overestimated_cumulated_length = 1.0 * max_curve_length * (max_order + 1);
-              const double threshold = bevel_factor_end * (overestimated_cumulated_length);
-              const double current_length = max_curve_length * order + curve_order_length;
+              const float overestimated_cumulated_length = max_curve_length * (max_order + 1);
+              const float threshold = bevel_factor_end * (overestimated_cumulated_length);
+              const float current_length = max_curve_length * order + curve_order_length;
               if (current_length >= threshold)
                 break;
             }
@@ -340,8 +355,34 @@ static bool ObtainCurveData(Mesh *mesh,
             }
             curve_length += step_length;
           }
-          CData->curvekey_co.push_back_slow(co);
-          CData->curvekey_radius.push_back_slow(b_curr_point.radius());
+          if(points_displacement > 0.0f && point != 0 && point < num_points-1)
+          {
+            //const float3 rand_co = get_float3();
+            // static_cast <float>
+            const float rx = -points_displacement/2 + rand() / static_cast <float>(RAND_MAX) * points_displacement;
+            const float ry = -points_displacement/2 + rand() / static_cast <float>(RAND_MAX) * points_displacement;
+            const float rz = -points_displacement/2 + rand() / static_cast <float>(RAND_MAX) * points_displacement;
+            const float rt = sinf(displacement_time);
+            CData->curvekey_co.push_back_slow(co + make_float3(rx*rt, ry*rt, rz*rt));
+          }
+          else
+          {
+            CData->curvekey_co.push_back_slow(co);
+          }
+          if(radii_displacement > 0.0f && point != 0 && point < num_points-1)
+          {
+            float rr = 0.0f;
+            if (additive_radii_displacement)
+              rr = -radii_displacement/2 + rand() / static_cast <float>(RAND_MAX) * radii_displacement;
+            else
+              rr = rand() / static_cast <float>(RAND_MAX) * radii_displacement;
+            const float rt = sinf(displacement_time);
+            CData->curvekey_radius.push_back_slow(b_curr_point.radius() + rr*rt);
+          }
+          else
+          {
+            CData->curvekey_radius.push_back_slow(b_curr_point.radius());
+          }
           CData->curvekey_time.push_back_slow(curve_length);
           CData->curvekey_key.push_back_slow(b_curr_point.key());
           CData->curvekey_value.push_back_slow(b_curr_point.value());
@@ -354,7 +395,7 @@ static bool ObtainCurveData(Mesh *mesh,
           // Duplicating code as there's no abstract class for BezierSplinePoint and SplinePoint
           const float3 co = get_float3(b_curr_point.co());
           const float key = b_curr_point.key();
-          const int order = std::floor(key);
+          const int order = (int) std::floor(key);
           if(point != 0)
           {
             const float step_length = len(co - prev_co);
@@ -370,9 +411,9 @@ static bool ObtainCurveData(Mesh *mesh,
               current_order = order;
               //if(order > order_threshold)// || bevel_factor_end < domain_start)
                 //break;
-              const double overestimated_cumulated_length = 1.0 * max_curve_length * (max_order + 1);
-              const double threshold = bevel_factor_end * (overestimated_cumulated_length);
-              const double current_length = max_curve_length * order + curve_order_length;
+              const float overestimated_cumulated_length = max_curve_length * (max_order + 1);
+              const float threshold = bevel_factor_end * (overestimated_cumulated_length);
+              const float current_length = max_curve_length * order + curve_order_length;
               if (current_length >= threshold)
                 break;
             }
@@ -383,8 +424,34 @@ static bool ObtainCurveData(Mesh *mesh,
             }
             curve_length += step_length;
           }
-          CData->curvekey_co.push_back_slow(co);
-          CData->curvekey_radius.push_back_slow(b_curr_point.radius());
+          if(points_displacement > 0.0f && point != 0 && point < num_points-1)
+          {
+            //const float3 rand_co = get_float3();
+            // static_cast <float>
+            const float rx = -points_displacement/2 + rand() / static_cast <float>(RAND_MAX) * points_displacement;
+            const float ry = -points_displacement/2 + rand() / static_cast <float>(RAND_MAX) * points_displacement;
+            const float rz = -points_displacement/2 + rand() / static_cast <float>(RAND_MAX) * points_displacement;
+            const float rt = sinf(displacement_time);
+            CData->curvekey_co.push_back_slow(co + make_float3(rx*rt, ry*rt, rz*rt));
+          }
+          else
+          {
+            CData->curvekey_co.push_back_slow(co);
+          }
+          if(radii_displacement > 0.0f && point != 0 && point < num_points-1)
+          {
+            float rr = 0.0f;
+            if (additive_radii_displacement)
+              rr = -radii_displacement/2 + rand() / static_cast <float>(RAND_MAX) * radii_displacement;
+            else
+              rr = rand() / static_cast <float>(RAND_MAX) * radii_displacement;
+            const float rt = sinf(displacement_time);
+            CData->curvekey_radius.push_back_slow(b_curr_point.radius() + rr*rt);
+          }
+          else
+          {
+            CData->curvekey_radius.push_back_slow(b_curr_point.radius());
+          }
           CData->curvekey_time.push_back_slow(curve_length);
           CData->curvekey_key.push_back_slow(b_curr_point.key());
           CData->curvekey_value.push_back_slow(b_curr_point.value());
@@ -475,7 +542,7 @@ static bool ObtainCurveData(Mesh *mesh,
         const float radius = radii[interp_i];
         const float key = custom_data_keys[interp_i];
         const float value = custom_data_values[interp_i];
-        const int order = std::floor(key);
+        const int order = (int) std::floor(key);
         
         if(!(point == 0 && interp_i == 0)) 
         {
@@ -492,9 +559,9 @@ static bool ObtainCurveData(Mesh *mesh,
             current_order = order;
             //if(order > order_threshold)// || bevel_factor_end < domain_start)
               //break;
-            const double overestimated_cumulated_length = 1.0 * max_curve_length * (max_order + 1);
-            const double threshold = bevel_factor_end * (overestimated_cumulated_length);
-            const double current_length = max_curve_length * order + curve_order_length;
+            const float overestimated_cumulated_length = max_curve_length * (max_order + 1);
+            const float threshold = bevel_factor_end * (overestimated_cumulated_length);
+            const float current_length = max_curve_length * order + curve_order_length;
             if (current_length >= threshold)
               break;
           }
@@ -505,8 +572,34 @@ static bool ObtainCurveData(Mesh *mesh,
           }
           curve_length += step_length;
         }
-        CData->curvekey_co.push_back_slow(co);
-        CData->curvekey_radius.push_back_slow(radius);
+        if(points_displacement > 0.0f && point != 0 && point < num_points-1)
+        {
+          //const float3 rand_co = get_float3();
+          // static_cast <float>
+          const float rx = -points_displacement/2 + rand() / static_cast <float>(RAND_MAX) * points_displacement;
+          const float ry = -points_displacement/2 + rand() / static_cast <float>(RAND_MAX) * points_displacement;
+          const float rz = -points_displacement/2 + rand() / static_cast <float>(RAND_MAX) * points_displacement;
+          const float rt = sinf(displacement_time);
+          CData->curvekey_co.push_back_slow(co + make_float3(rx*rt, ry*rt, rz*rt));
+        }
+        else
+        {
+          CData->curvekey_co.push_back_slow(co);
+        }
+        if(radii_displacement > 0.0f && point != 0 && point < num_points-1)
+        {
+          float rr = 0.0f;
+          if (additive_radii_displacement)
+            rr = -radii_displacement/2 + rand() / static_cast <float>(RAND_MAX) * radii_displacement;
+          else
+            rr = rand() / static_cast <float>(RAND_MAX) * radii_displacement;
+          const float rt = sinf(displacement_time);
+          CData->curvekey_radius.push_back_slow(radius + rr*rt);
+        }
+        else
+        {
+          CData->curvekey_radius.push_back_slow(radius);
+        }
         CData->curvekey_time.push_back_slow(curve_length);
         CData->curvekey_key.push_back_slow(key);
         CData->curvekey_value.push_back_slow(value);
