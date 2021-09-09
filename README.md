@@ -1,4 +1,4 @@
-![](https://www.antillevisuals.com/technical-research/cycles_mod_splines_as_hair.jpg)
+![](https://www.nicolasantille.com/technical-research/cycles_mod_splines_as_hair.jpg)
 
 # Render splines using Cycles hair primitives
 This is a Cycles modification that allows you to skip meshing splines entirely and render them as hair. Needless to say, with this method you can render *lots* of them. Hello large scale graphs! This feature is primarily intented for CPU rendering because GPUs don't have access to enough memory for large-scale rendering and Cycles isn't an out-of-core renderer.
